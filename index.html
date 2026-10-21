@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Warmhug</title>
+<meta name="warmhug-build" content="v12.7">
 <meta name="claude:viewport-fit-sides" content="cover">
 <meta name="description" content="Warmhug — لاصقات التدفئة بالأعشاب الطبيعية">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -87,7 +88,7 @@ button{cursor:pointer;background:none;border:0;padding:0;-webkit-tap-highlight-c
 .layer.off{visibility:hidden}
 .world{z-index:20}
 .home{z-index:10;background:var(--night)}
-.moving .layer{scrollbar-width:none}
+.moving .layer{scrollbar-width:none;pointer-events:none}
 .ghost{position:fixed;z-index:45;pointer-events:none;border:1.5px solid var(--gold);border-radius:50%;box-sizing:border-box}
 .ghost-img{position:fixed;z-index:45;pointer-events:none;transform-origin:0 0;max-width:none}
 
@@ -466,6 +467,19 @@ input,select,textarea{width:100%;min-height:48px;padding:10px 0;border:0;border-
 textarea{min-height:110px;resize:vertical}
 @media (min-width:900px){ .contact{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:7vw;margin-top:24px} .pair{grid-template-columns:1fr 1fr} }
 
+/* build id + navigation log (diagnostics) */
+.build{position:absolute;z-index:4;bottom:max(6px,env(safe-area-inset-bottom,0px));inset-inline-end:max(12px,env(safe-area-inset-right,0px));margin:0;font:400 10px/1 var(--f-body);letter-spacing:.06em;color:rgba(251,246,242,.38);direction:ltr}
+#dbg{position:fixed;z-index:80;left:8px;right:8px;bottom:max(6px,env(safe-area-inset-bottom,0px));max-height:46svh;display:flex;flex-direction:column;background:#120a15;color:#e8e0ea;border:1px solid rgba(217,195,154,.45);border-radius:10px;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;direction:ltr;text-align:left;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+#dbg .dbg-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:8px;border-bottom:1px solid rgba(255,255,255,.12)}
+#dbg .dbg-head b{flex:1;color:var(--gold);font-weight:600;min-width:120px}
+#dbg button{font:600 12px/1 var(--f-body);color:#120a15;background:var(--gold);border-radius:14px;height:32px;padding:0 12px}
+#dbg button.ghostbtn{background:transparent;color:#e8e0ea;border:1px solid rgba(255,255,255,.3)}
+#dbg ol{list-style:none;margin:0;padding:6px 8px;overflow:auto;flex:1}
+#dbg .last,#dbg #dbg-toggle{display:none}
+#dbg li{white-space:pre-wrap;word-break:break-word;border-bottom:1px dotted rgba(255,255,255,.08);padding:2px 0}
+#dbg li.bad{color:#ffb4a2}#dbg li.ok{color:#bfe8c4}#dbg li.nav{color:#f3dca8}
+#dbg textarea{margin:6px 8px 8px;height:90px;font:10px/1.3 ui-monospace,monospace;background:#000;color:#ddd;border:1px solid #444}
+#dbg .msg{color:#bfe8c4;font-size:11px;padding:0 8px 6px}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms!important;animation-delay:0s!important;transition:none!important}
 }
@@ -505,6 +519,7 @@ textarea{min-height:110px;resize:vertical}
           <nav class="edges" id="edges" aria-label="Sections"></nav>
         </div>
       </div>
+      <p class="build" id="build"></p>
       <p class="hint" id="hint"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><circle cx="8" cy="8" r="2.2" fill="currentColor"/><circle cx="8" cy="8" r="6"/></svg><span data-t="hint"></span></p>
     </div>
   </section>
@@ -518,6 +533,17 @@ textarea{min-height:110px;resize:vertical}
   <section class="layer world off" id="w-contact" data-world="contact" data-tone="light" aria-labelledby="h-contact"></section>
 </main>
 <p class="sr" id="live" aria-live="polite"></p>
+<div id="dbg" hidden role="region" aria-label="Navigation log">
+  <div class="dbg-head"><b id="dbg-title">NAV LOG</b>
+    <span class="last" id="dbg-last"></span>
+    <button type="button" id="dbg-toggle" class="ghostbtn" aria-expanded="false">السجل</button>
+    <button type="button" id="dbg-copy">نسخ السجل · Copy</button>
+    <button type="button" id="dbg-clear" class="ghostbtn">مسح</button>
+    <button type="button" id="dbg-close" class="ghostbtn">إغلاق</button></div>
+  <p class="msg" id="dbg-msg" hidden></p>
+  <ol id="dbg-list"></ol>
+  <textarea id="dbg-txt" readonly hidden aria-label="Log text"></textarea>
+</div>
 
 <script>
 (()=>{
@@ -825,25 +851,78 @@ function renderWorld(id){
 }
 function renderAll(){renderHome(); Object.keys(W).forEach(renderWorld); setCrumb(targetView());}
 
-/* ================= JOURNEY (enter / leave / swap) =================
-   One controller owns every transition. A new request finishes or reverses the one in flight,
-   so scenes never stack and the UI never locks. */
+/* ================= NAVIGATION =================
+   One controller (NAV) owns the visible scene, the transition in flight and the browser-history entry.
+     phase: "home" | "entering" | "world" | "leaving"     kind: "enter" | "leave" | "swap" | null
+   Every transition gets a new operation number (NAV.op). Animation-end callbacks and timers carry the number
+   they were created with and do nothing if a newer operation has started; starting one also clears old timers.
+   There are no retries and no delayed re-routing: nothing pending can reopen a section later. */
 const DUR=720, EASE="cubic-bezier(.32,.72,.16,1)";
-let T=null, tok=0, lastFocusId=null;
+const NAV={phase:"home",kind:null,id:null,op:0,anims:[],timers:[]};
+const BASE=location.pathname+location.search;
+const BUILD="v12.7";
+document.documentElement.dataset.build=BUILD;
+
+/* ---------- navigation log (diagnostics) ----------
+   Always recorded in memory (last 300 events); the panel shows it. Open with ?debug in the URL,
+   or tap the Warmhug logo 5 times within 2 seconds (no developer tools needed). */
+const DBG={on:false,buf:[],t0:performance.now(),taps:[]};
+try{ DBG.on=/[?&]debug\b/.test(location.search)||localStorage.getItem("wh-debug")==="1"; }catch(_){ DBG.on=/[?&]debug\b/.test(location.search); }
+function desc(el){
+  if(!el||!el.closest) return el===window?"window":(el&&el.nodeName)||"-";
+  const n=el.closest("[data-go],[data-next],[data-home],button,a,input,select,textarea,h2")||el;
+  let s=n.tagName.toLowerCase(); if(n.id) s+="#"+n.id;
+  if(n.dataset){ if(n.dataset.go) s+="[go="+n.dataset.go+"]"; if(n.dataset.next) s+="[next="+n.dataset.next+"]"; if(n.dataset.home!==undefined) s+="[home]"; }
+  if(!n.id&&!n.dataset?.go&&!n.dataset?.next&&n.classList&&n.classList.length) s+="."+[...n.classList].slice(0,2).join(".");
+  const layer=n.closest(".layer,.bar,#dbg"); return s+" @"+(layer?(layer.id||"bar"):"doc");
+}
+function log(kind,d={}){
+  const st=history.state;
+  DBG.buf.push({t:Math.round(performance.now()-DBG.t0),kind,...d,screen:typeof view==="string"?view:"?",phase:NAV.phase,op:NAV.op,
+    hash:location.hash||"∅",hist:st&&st.wh?(st.id||"home")+(st.fromHome?"(pushed)":st.id?"(stamped)":""):"none"});
+  if(DBG.buf.length>300) DBG.buf.shift();
+  if(DBG.on) paintDbg();
+}
+function fmt(e){
+  const {t,kind,screen,phase,op,hash,hist,...rest}=e;
+  const extra=Object.entries(rest).map(([k,v])=>k+"="+v).join(" ");
+  return `${String(t).padStart(6)}ms ${kind.padEnd(16)} ${extra}  | screen=${screen} phase=${phase} op=${op} hash=${hash} state=${hist}`;
+}
+let dbgRaf=0;
+function paintDbg(){ if(dbgRaf) return; dbgRaf=requestAnimationFrame(()=>{ dbgRaf=0; const box=$("#dbg"); if(!box||box.hidden) return;
+  const last=DBG.buf[DBG.buf.length-1]; $("#dbg-last").textContent=last?`${last.t}ms ${last.kind} ${last.decision||last.why||last.target||""}`:"";
+  if(!box.classList.contains("open")) return;
+  const L=$("#dbg-list"); L.innerHTML=DBG.buf.slice(-60).map(e=>`<li class="${/reject|ignored|stale/.test(e.kind+(e.decision||""))?"bad":/^(enter|leave|swap|reverse|settle)/.test(e.kind)?"nav":/request/.test(e.kind)?"ok":""}">${esc(fmt(e))}</li>`).join(""); L.scrollTop=L.scrollHeight; }); }
+function setDbg(on){
+  DBG.on=on; try{ localStorage.setItem("wh-debug",on?"1":"0"); }catch(_){}
+  const box=$("#dbg"); box.hidden=!on; box.classList.add("open"); $("#dbg-title").textContent=`NAV LOG · ${BUILD} · ${navigator.userAgent.match(/(Firefox|Edg|OPR|CriOS|FxiOS|Chrome|Version\/[\d.]+ (Mobile\/\w+ )?Safari|Safari)/)?.[0]||"browser"}`;
+  log("debug",{state:on?"on":"off"}); if(on) paintDbg();
+}
+function logText(){ return [`Warmhug ${BUILD}`,`buttons now: ${[...document.querySelectorAll(isWide()?"#spots .spot .tag":".edge")].map(b=>{const r=b.getBoundingClientRect();return (b.closest("[data-go]").dataset.go)+"@"+Math.round(r.left)+","+Math.round(r.top)+"→"+Math.round(r.right)+","+Math.round(r.bottom)}).join(" ")}`,`UA: ${navigator.userAgent}`,`URL: ${location.href}`,`viewport: ${innerWidth}x${innerHeight} dpr=${devicePixelRatio} reducedMotion=${matchMedia("(prefers-reduced-motion: reduce)").matches}`,"",...DBG.buf.map(fmt)].join("\n"); }
 const mirror=e=>{const m=e.match(/[\d.]+/g).map(Number);return `cubic-bezier(${1-m[2]},${1-m[3]},${1-m[0]},${1-m[1]})`;};
 function anim(list,el,kf,{d=0,D=DUR,e=EASE}={},rev=false){
   if(!el) return null;
   const a=el.animate(kf,{duration:D,delay:rev?Math.max(0,DUR-d-D):d,easing:rev?mirror(e):e,fill:"both",direction:rev?"reverse":"normal"});
   a.id="journey"; list.push(a); return a;
 }
-function targetView(){ if(!T) return view; if(T.kind==="leave"||T.rev) return "home"; return T.id; }
+/* where the UI is, or is heading to */
+function targetView(){ return (NAV.phase==="home"||NAV.phase==="leaving")?"home":NAV.id; }
+function busy(){ return NAV.phase==="entering"||NAV.phase==="leaving"; }
 function setTone(id){document.body.dataset.tone=id==="home"?"":$("#w-"+id).dataset.tone;}
 function setCrumb(id){
   const c=$("#crumb"),b=$("#back");
   if(id==="home"){c.innerHTML="";b.hidden=true;return;}
   b.hidden=false; c.innerHTML=(NUM[id]?`<span class="num">${NUM[id]}</span>`:"")+esc(U().names[id]);
 }
+function newOp(){ NAV.op++; NAV.timers.forEach(clearTimeout); NAV.timers=[]; return NAV.op; }
+function later(op,ms,fn){ NAV.timers.push(setTimeout(()=>{ if(NAV.op===op) fn(); else log("timer-stale",{of:op}); },ms)); }
+function done(op,anims,fn){ Promise.all(anims.map(a=>a.finished)).then(()=>{ if(NAV.op===op){ log("anim-done",{of:op}); fn(); } else log("anim-cb-stale",{of:op}); },()=>{}); }
+/* while a transition runs, both scenes are locked; only the top bar (back / language) stays live */
+function lock(){ document.body.classList.add("moving"); $("#home").inert=true; $$(".world").forEach(w=>w.inert=true); }
+/* the single place that decides the final, static state. Idempotent. */
 function settle(target){
+  newOp();
+  NAV.anims.forEach(a=>{ try{a.cancel();}catch(_){} }); NAV.anims=[];
   document.getAnimations().forEach(a=>{ if(a.id==="journey") a.cancel(); });
   $$(".ghost,.ghost-img").forEach(g=>g.remove());
   const home=$("#home"), isHome=target==="home";
@@ -851,11 +930,36 @@ function settle(target){
   $$(".world").forEach(w=>{const on=w.dataset.world===target; w.classList.toggle("off",!on); w.inert=!on; w.style.zIndex="";});
   $$(".pressed,.launch").forEach(s=>s.classList.remove("pressed","launch"));
   $("#boxin").style.transformOrigin="";
+  NAV.phase=isHome?"home":"world"; NAV.kind=null; NAV.id=isHome?null:target;
   view=target; setTone(target); setCrumb(target);
   document.body.classList.remove("moving");
+  NAV.settledAt=performance.now();
+  log("settle",{to:target});
 }
-function finishNow(){ if(!T) return; const t=T; T=null; tok++; settle(t.kind==="leave"||t.rev?"home":t.id); }
-function whenDone(t,anims,fn){ Promise.all(anims.map(a=>a.finished)).then(()=>{ if(T&&T.t===t){ T=null; fn(); } }).catch(()=>{}); }
+/* land whatever is in flight immediately, at the place it was heading to */
+function finishActive(){ if(busy()) settle(targetView()); }
+
+/* ---------- history: one entry per visit to a section, pushed from a home entry ----------
+   home entry:    {wh:1, id:null}
+   section entry: {wh:1, id, fromHome:true}   (pushed by us on top of a home entry)
+                  {wh:1, id, fromHome:false}  (stamped: a hash we did not create, e.g. typed by hand) */
+function histHome(){ return {wh:1,id:null}; }
+function stamp(state,url,push){ try{ history[push?"pushState":"replaceState"](state,"",url); }catch(_){} }
+/* in-site "back" never calls history.back(): that call is asynchronous and makes the browser fire
+   popstate/hashchange later, at a time that differs between browsers and in-app viewers. Instead the current
+   entry is rewritten to home, synchronously. The next section visit reuses this entry, so history stays short. */
+function historyToHome(){ log("history",{action:"replace->home"}); stamp({wh:1,id:null,reuse:true},BASE,false); }
+function onHistory(ev){
+  let st=history.state; const h=location.hash.slice(1);
+  if(!(st&&st.wh)){ st={wh:1,id:W[h]?h:null,fromHome:false}; stamp(st,st.id?"#"+st.id:BASE,false); }
+  const target=st.id||"home";
+  log(ev?ev.type:"history-event",{dest:target});
+  /* browser back/forward: the browser already shows its own transition, so the scene changes instantly */
+  request(target,{source:"history",via:ev?ev.type:"history"});
+}
+/* popstate and hashchange can both fire for one traversal; the second finds the UI already heading there and does nothing */
+addEventListener("popstate",onHistory);
+addEventListener("hashchange",onHistory);
 
 /* the point every journey is centred on */
 function pointFor(id,trigger){
@@ -871,32 +975,34 @@ function visibleRect(el){ if(!el) return null; const r=el.getBoundingClientRect(
 
 /* build the whole journey for home <-> world `id`. rev=true plays it backwards (leaving). */
 function journey(id,p,rev){
+  /* every piece of the journey must receive `rev`: without it a return plays the entry forwards (bug fixed in v12.7) */
+  const J=(el,kf,o)=>anim(L,el,kf,o,rev);
   const L=[], home=$("#home"), w=$("#w-"+id), boxin=$("#boxin");
   /* measure the arrival element before anything moves */
   let anchor=$("[data-anchor]",w), ar=visibleRect(anchor);
   if(!ar){ anchor=$("h2.h2",w); ar=visibleRect(anchor); }
   const product=id==="product";
   const tab=!isWide()&&id!=="contact"?$(`.edge[data-go="${id}"]`):null, tr=tab?tab.getBoundingClientRect():null;
-  anim(L,$("#edges"),[{opacity:1},{opacity:0}],{D:220,e:"cubic-bezier(.4,0,.6,1)"});
+  J($("#edges"),[{opacity:1},{opacity:0}],{D:220,e:"cubic-bezier(.4,0,.6,1)"});
   /* 1. the scene: far layers move little, the pack moves past the camera, labels clear away from the point */
   const br=boxin.getBoundingClientRect();
   boxin.style.transformOrigin=`${p.x-br.left}px ${p.y-br.top}px`;
-  anim(L,$(".atmo",home),[{transform:"scale(1)",opacity:1},{opacity:1,offset:.35},{transform:"scale(1.12)",opacity:0}],{D:DUR});
+  J($(".atmo",home),[{transform:"scale(1)",opacity:1},{opacity:1,offset:.35},{transform:"scale(1.12)",opacity:0}],{D:DUR});
   if(product){
-    anim(L,$("#shot"),[{opacity:1},{opacity:0}],{D:60,e:"cubic-bezier(.4,0,.6,1)"});
-    anim(L,$("#spots"),[{opacity:1},{opacity:0}],{D:200,e:"cubic-bezier(.4,0,.6,1)"});
+    J($("#shot"),[{opacity:1},{opacity:0}],{D:60,e:"cubic-bezier(.4,0,.6,1)"});
+    J($("#spots"),[{opacity:1},{opacity:0}],{D:200,e:"cubic-bezier(.4,0,.6,1)"});
   }else{
-    anim(L,boxin,[{transform:"scale(1)",opacity:1},{opacity:1,offset:.42},{transform:"scale(2.15)",opacity:0}],{D:600,e:"cubic-bezier(.45,.05,.2,1)"});
-    anim(L,$("#spots"),[{opacity:1},{opacity:0}],{D:200,e:"cubic-bezier(.4,0,.6,1)"});
+    J(boxin,[{transform:"scale(1)",opacity:1},{opacity:1,offset:.42},{transform:"scale(2.15)",opacity:0}],{D:600,e:"cubic-bezier(.45,.05,.2,1)"});
+    J($("#spots"),[{opacity:1},{opacity:0}],{D:200,e:"cubic-bezier(.4,0,.6,1)"});
   }
   ["#intro","#hint"].forEach(s=>{const el=$(s,home); const r=visibleRect(el); if(!r) return;
     const cx=r.left+r.width/2-p.x, cy=r.top+r.height/2-p.y, m=Math.hypot(cx,cy)||1;
-    anim(L,el,[{transform:"none",opacity:1},{transform:`translate(${cx/m*28}px,${cy/m*28}px)`,opacity:0}],{D:240,e:"cubic-bezier(.4,0,.2,1)"});});
+    J(el,[{transform:"none",opacity:1},{transform:`translate(${cx/m*28}px,${cy/m*28}px)`,opacity:0}],{D:240,e:"cubic-bezier(.4,0,.2,1)"});});
   /* 2. the world grows out of the same point */
-  anim(L,w,[{opacity:0},{opacity:1}],{d:200,D:360,e:"cubic-bezier(.3,0,.3,1)"});
+  J(w,[{opacity:0},{opacity:1}],{d:200,D:360,e:"cubic-bezier(.3,0,.3,1)"});
   const inner=$(".inner",w), ir=inner.getBoundingClientRect();
   const icx=ir.left+ir.width/2, icy=Math.min(ir.top+ir.height/2, innerHeight/2);
-  anim(L,inner,[{transform:`translate(${(p.x-icx)*.22}px,${(p.y-icy)*.22}px) scale(.9)`},{transform:"none"}],{d:170,D:550});
+  J(inner,[{transform:`translate(${(p.x-icx)*.22}px,${(p.y-icy)*.22}px) scale(.9)`},{transform:"none"}],{d:170,D:550});
   /* 3. one element travels between the two worlds */
 
   if(ar){
@@ -908,8 +1014,8 @@ function journey(id,p,rev){
       const g=new Image(); g.src=IMG.cfront; g.className="ghost-img"; g.alt="";
       Object.assign(g.style,{left:s.left+"px",top:s.top+"px",width:s.width+"px",height:s.width/A+"px"});
       document.body.appendChild(g);
-      anim(L,g,[{transform:"translate(0,0) scale(1)"},{transform:`translate(${cl-s.left}px,${ct-s.top}px) scale(${cw/s.width})`}],{D:640,e:"cubic-bezier(.5,0,.15,1)"});
-      anim(L,anchor,[{opacity:0},{opacity:0,offset:.99},{opacity:1}],{D:DUR});
+      J(g,[{transform:"translate(0,0) scale(1)"},{transform:`translate(${cl-s.left}px,${ct-s.top}px) scale(${cw/s.width})`}],{D:640,e:"cubic-bezier(.5,0,.15,1)"});
+      J(anchor,[{opacity:0},{opacity:0,offset:.99},{opacity:1}],{D:DUR});
     }else{
       const circle=!["care","contact","faq"].includes(id)||anchor.classList.contains("qno"), side=Math.max(ar.width,ar.height)*(id==="faq"?1.35:id==="how"?1:.95);
       const tw=circle?side:ar.width+10, th=circle?side:ar.height+10;
@@ -920,114 +1026,174 @@ function journey(id,p,rev){
       /* the outline lifts off the pressed capsule while the capsule itself fades with the other tabs */
       const from=tr?{left:tr.left+"px",top:tr.top+"px",width:tr.width+"px",height:tr.height+"px",borderRadius:"22px",backgroundColor:"rgba(251,246,242,0)",borderColor:"rgba(217,195,154,1)",opacity:1}
                     :{left:p.x-11+"px",top:p.y-11+"px",width:"22px",height:"22px",borderRadius:"50%",backgroundColor:"rgba(251,246,242,0)",borderColor:"rgba(217,195,154,1)",opacity:1};
-      anim(L,g,[from,
+      J(g,[from,
                 {opacity:1,offset:.78},
                 {left:tx+"px",top:ty+"px",width:tw+"px",height:th+"px",borderRadius:circle?"50%":"8px",backgroundColor:"rgba(251,246,242,0)",borderColor:dark?"rgba(217,195,154,.55)":"rgba(109,71,130,.45)",opacity:0}],{D:660,e:"cubic-bezier(.5,0,.15,1)"});
-      anim(L,anchor,[{opacity:0},{opacity:1}],{d:440,D:260});
+      J(anchor,[{opacity:0},{opacity:1}],{d:440,D:260});
     }
   }
   return L;
 }
 
-function go(id,trigger,opts={}){ if(!W[id]) return; const cur=targetView(); if(cur===id) return; if(cur==="home") enter(id,trigger,opts); else swap(id,trigger,opts); }
-
-function enter(id,trigger,{push=true,instant=false}={}){
-  if(T) finishNow();
-  if(view===id) return;
-  if(view!=="home") return swap(id,trigger,{push});
-  const home=$("#home"), w=$("#w-"+id);
-  const p=pointFor(id,trigger); lastFocusId=id;
-  if(push){ try{ history.pushState({w:id},"","#"+id); }catch(e){} }
-  renderWorld(id); w.scrollTop=0;
-  w.classList.remove("off"); w.inert=false; home.inert=true;
-  $(`.spot[data-go="${id}"]`)?.classList.add("pressed","launch");
-  if(instant||reduce()||!w.animate){ settle(id); focusWorld(id); return; }
-  document.body.classList.add("moving");
-  const t=++tok, anims=journey(id,p,false);
-  T={kind:"enter",id,t,anims,rev:false};
-  setTimeout(()=>{ if(T&&T.t===t&&!T.rev){ setTone(id); setCrumb(id); } },DUR*.35);
-  whenDone(t,anims,()=>{ settle(id); focusWorld(id); });
+/* every navigation request goes through here, whether it comes from a click, a key, the browser or the boot */
+function request(target,{trigger=null,source="ui",via="ui"}={}){
+  const R=decision=>log("request",{dest:target,source:via,from:trigger?desc(trigger):"-",decision});
+  if(target!=="home"&&!W[target]){ R("ignored: unknown destination"); return; }
+  const instant=source==="history";
+  if(target===targetView()){ R("ignored: already there or already heading there"); return; }
+  if(target==="home"){
+    if(NAV.phase==="entering"&&NAV.kind==="enter"&&!instant){ R("accepted: reverse the entry in flight"); return reverseEnter(source); }
+    finishActive();
+    if(NAV.phase==="home"){ R("ignored: home after landing"); return; }
+    if(instant){ R("accepted: home (instant, browser history)"); const id=NAV.id; settle("home"); focusHome(id); return; }
+    R("accepted: leave"); return leave(source);
+  }
+  finishActive();
+  if(NAV.phase==="home"){ R(instant?"accepted: enter (instant, browser history)":"accepted: enter"); return enter(target,trigger,source,instant); }
+  R("accepted: swap"); return swap(target,trigger,source,instant);
 }
 
-function leave({fromPop=false}={}){
-  if(T){
-    if(T.kind==="enter"&&!T.rev){                       // back pressed mid-flight: play the same journey backwards from here
-      T.rev=true; const t=T.t=++tok, id=T.id; $("#home").inert=false;
-      T.anims.forEach(a=>a.reverse()); setTone("home"); setCrumb("home");
-      if(!fromPop){ try{ history.replaceState(null,"",location.pathname+location.search); }catch(e){} }
-      whenDone(t,T.anims,()=>{ settle("home"); focusHome(id); });
-      return;
-    }
-    if(T.kind==="leave"||T.rev) return;
-    finishNow();
-  }
-  if(view==="home") return;
-  const id=view, home=$("#home"), w=$("#w-"+id);
-  if(!fromPop){ try{ history.replaceState(null,"",location.pathname+location.search); }catch(e){} }
-  home.classList.remove("off"); home.inert=false; w.inert=true;
-  const p=pointFor(id);
+function enter(id,trigger,source,instant=false){
+  const home=$("#home"), w=$("#w-"+id);
+  const p=pointFor(id,trigger);
+  const op=newOp(); NAV.phase="entering"; NAV.kind="enter"; NAV.id=id; log("enter-start",{to:id});
+  if(source==="ui"){ const st=history.state; stamp({wh:1,id,fromHome:true},"#"+id,!(st&&st.wh&&st.reuse)); }   // one entry, reused after an in-site back
+  renderWorld(id); w.scrollTop=0; w.classList.remove("off");
+  lock();
+  $(`.spot[data-go="${id}"]`)?.classList.add("pressed","launch");
+  if(instant||reduce()||!w.animate){ settle(id); focusWorld(id); return; }
+  setCrumb(id);                                                      // "back" is available from the first frame of the entry
+  NAV.anims=journey(id,p,false);
+  later(op,DUR*.35,()=>{ setTone(id); });
+  done(op,NAV.anims,()=>{ settle(id); focusWorld(id); });
+}
+
+function reverseEnter(source){
+  const id=NAV.id, op=newOp(); NAV.phase="leaving"; NAV.kind="leave"; log("reverse-start",{from:id});
+  if(source==="ui") historyToHome();
+  NAV.anims.forEach(a=>a.reverse());
+  setTone("home"); setCrumb("home");
+  done(op,NAV.anims,()=>{ settle("home"); focusHome(id); });
+}
+
+function leave(source){
+  const id=NAV.id, home=$("#home"), w=$("#w-"+id);
+  const op=newOp(); NAV.phase="leaving"; NAV.kind="leave"; log("leave-start",{from:id});
+  if(source==="ui") historyToHome();
+  home.classList.remove("off"); lock();
   if(reduce()||!w.animate){ settle("home"); focusHome(id); return; }
-  document.body.classList.add("moving");
-  const t=++tok, anims=journey(id,p,true);
-  T={kind:"leave",id,t,anims,rev:false};
-  setTimeout(()=>{ if(T&&T.t===t){ setTone("home"); setCrumb("home"); } },DUR*.4);
-  whenDone(t,anims,()=>{ settle("home"); focusHome(id); });
+  NAV.anims=journey(id,pointFor(id),true);
+  later(op,DUR*.4,()=>{ setTone("home"); setCrumb("home"); });
+  done(op,NAV.anims,()=>{ settle("home"); focusHome(id); });
 }
 
 /* world → world: the current world recedes past the camera, the next one settles in from just behind it */
-function swap(id,trigger,{push=true}={}){
-  if(T) finishNow();
-  if(view===id||view==="home") return view==="home"?enter(id,trigger,{push}):undefined;
-  const a=$("#w-"+view), b=$("#w-"+id);
-  if(push){ try{ history.replaceState({w:id},"","#"+id); }catch(e){} }
-  renderWorld(id); b.scrollTop=0; b.classList.remove("off"); b.inert=false; a.inert=true; b.style.zIndex=21;
-  lastFocusId=id;
-  if(reduce()||!b.animate){ settle(id); focusWorld(id); return; }
-  document.body.classList.add("moving");
-  const L=[], t=++tok;
+function swap(id,trigger,source,instant=false){
+  const from=NAV.id, a=$("#w-"+from), b=$("#w-"+id);
+  const op=newOp(); NAV.phase="entering"; NAV.kind="swap"; NAV.id=id; log("swap-start",{from,to:id});
+  if(source==="ui"){ const st=history.state; stamp({wh:1,id,fromHome:!!(st&&st.wh&&st.fromHome)},"#"+id,false); }
+  renderWorld(id); b.scrollTop=0; b.classList.remove("off"); b.style.zIndex=21;
+  lock();
+  if(instant||reduce()||!b.animate){ settle(id); focusWorld(id); return; }
+  const L=[];
   anim(L,a,[{transform:"scale(1)",opacity:1},{transform:"scale(1.05)",opacity:0}],{D:340,e:"cubic-bezier(.4,0,.2,1)"});
   anim(L,b,[{opacity:0},{opacity:1}],{d:120,D:360,e:"cubic-bezier(.3,0,.3,1)"});
   anim(L,$(".inner",b),[{transform:"translateY(18px) scale(.97)"},{transform:"none"}],{d:120,D:480});
-  T={kind:"swap",id,t,anims:L,rev:false};
-  setTimeout(()=>{ if(T&&T.t===t){ setTone(id); setCrumb(id); } },180);
-  whenDone(t,L,()=>{ settle(id); focusWorld(id); });
+  NAV.anims=L;
+  later(op,180,()=>{ setTone(id); setCrumb(id); });
+  done(op,L,()=>{ settle(id); focusWorld(id); });
 }
 function focusWorld(id){ $("#h-"+id)?.focus({preventScroll:true}); $("#live").textContent=U().names[id]; }
 function focusHome(id){
   const el=id==="contact"?$("#nav-contact"):(isWide()?$(`.spot[data-go="${id}"]`):$(`.edge[data-go="${id}"]`));
   el?.focus({preventScroll:true}); $("#live").textContent=U().home;
 }
-function goHome(){
-  if(targetView()==="home") return;
-  if(history.state&&history.state.w){ history.back(); } else leave();
-}
-function syncRoute(){
-  const h=location.hash.slice(1), cur=targetView();
-  if(W[h]){ if(h!==cur) go(h,null,{push:false}); }
-  else if(cur!=="home") leave({fromPop:true});
-}
-addEventListener("popstate",syncRoute);
-addEventListener("hashchange",syncRoute);
+function goHome(via="ui"){ request("home",{source:"ui",via}); }
 
 /* ================= INTERACTIONS ================= */
+/* ---------- activation ----------
+   Navigation controls are activated by the gesture itself, not by the browser's synthesized click.
+   v12.3 proven cause: a touch that starts while the scene is changing and ends after it has settled was
+   turned by the browser into a click on whatever was then under the finger (a section tab), reopening it.
+   Browsers also differ in which element they send that click to. So for touch/pen a control fires on pointerup
+   only if the same press began on it, on a stable screen, nothing changed since, and the finger is still on it;
+   the click that follows is then swallowed. Mouse uses click with the same press check. Keyboard and assistive
+   technology (click with detail 0, no pointer press) work as usual. */
+const NAVSEL="[data-go],[data-next],[data-home],#back,#brand";
+let press=null, swallowUntil=0;
+function pressOK(el){
+  if(!press) return [false,"no press"];
+  if(!press.stable) return [false,"press began during a transition"];
+  if(press.el!==el) return [false,"press began on another element"];
+  if(press.op!==NAV.op&&!el.closest(".bar")) return [false,"screen changed since the press began"];
+  return [true,"press began on this control, screen stable"];
+}
+function activate(el,via){
+  if(el.closest("#brand")){ const now=performance.now(); DBG.taps=DBG.taps.filter(x=>now-x<2000); DBG.taps.push(now); if(DBG.taps.length>=5){ DBG.taps=[]; setDbg(!DBG.on); return; } }
+  if(el.dataset.go||el.dataset.next) request(el.dataset.go||el.dataset.next,{trigger:el,via});
+  else goHome(via+" "+desc(el));
+}
+window.addEventListener("pointerdown",e=>{
+  swallowUntil=0;
+  const el=e.target.closest?e.target.closest(NAVSEL):null;
+  const bar=!!(el&&el.closest(".bar"));
+  press={el,op:NAV.op,stable:bar||!busy(),x:e.clientX,y:e.clientY,id:e.pointerId,type:e.pointerType};
+  log("pointerdown",{target:desc(e.target),type:e.pointerType,stable:press.stable,at:Math.round(e.clientX)+","+Math.round(e.clientY),
+    sinceSettle:NAV.settledAt?Math.round(performance.now()-NAV.settledAt)+"ms":"-"});
+},true);
+window.addEventListener("pointerup",e=>{
+  log("pointerup",{target:desc(e.target),type:e.pointerType});
+  if(!press||press.id!==e.pointerId||e.pointerType==="mouse") return;
+  const p=press; press=null;
+  /* every click the browser derives from this touch belongs to this gesture and is ignored for navigation,
+     whichever element it lands on; the window only covers this gesture's own click */
+  swallowUntil=e.timeStamp+800;
+  if(!p.el){ log("tap-ignored",{why:p.stable?"not on a control":"touch began during a transition"}); return; }
+  const under=document.elementFromPoint(e.clientX,e.clientY);
+  const moved=Math.hypot(e.clientX-p.x,e.clientY-p.y)>12;
+  if(moved||!under||!p.el.contains(under)){ log("tap-rejected",{target:desc(p.el),why:moved?"finger moved":"finger left the control"}); return; }
+  press=p; const [ok,why]=pressOK(p.el); press=null;
+  if(!ok){ log("tap-rejected",{target:desc(p.el),why}); return; }
+  activate(p.el,"tap");
+},true);
+window.addEventListener("pointercancel",e=>{ press=null; log("pointercancel",{target:desc(e.target)}); },true);
+/* a held key auto-repeats; after a return, focus is back on the section's tab, so a repeat would reopen it */
+window.addEventListener("keydown",e=>{
+  if(e.key!=="Enter"&&e.key!==" "&&e.key!=="Escape") return;
+  log("keydown",{key:e.key===" "?"Space":e.key,target:desc(e.target),repeat:e.repeat});
+  if(e.repeat&&(e.key==="Escape"||e.target.closest?.("[data-go],[data-next],[data-home],#back,#brand"))){ e.preventDefault(); e.stopImmediatePropagation(); log("key-repeat-ignored",{key:e.key}); }
+},true);
+window.addEventListener("focusin",e=>{ if(e.target.closest?.("[data-go],[data-next],#back,h2")) log("focus",{target:desc(e.target)}); },true);
+
 /* instant feedback: the pressed point reacts on pointerdown, before the click is even complete */
 document.addEventListener("pointerdown",e=>{
+  if(busy()) return;
   const g=e.target.closest("#home [data-go]"); if(!g) return;
   $(`.spot[data-go="${g.dataset.go}"]`)?.classList.add("pressed"); g.classList.add("pressed");
 },{passive:true});
-document.addEventListener("pointercancel",()=>{ if(!T) $$(".pressed").forEach(s=>s.classList.remove("pressed")); });
+/* a press that does not become a click (finger moved off, scroll) must not leave the tab looking pressed */
+const unpress=()=>{ if(NAV.phase==="home") $$("#home .pressed").forEach(s=>s.classList.remove("pressed")); };
+document.addEventListener("pointercancel",unpress);
+document.addEventListener("pointerup",()=>{ if(NAV.phase==="home") requestAnimationFrame(unpress); });
 document.addEventListener("click",e=>{
   const t=e.target;
-  const g=t.closest("[data-go]"); if(g){ go(g.dataset.go,g); return; }
-  const nx=t.closest("[data-next]"); if(nx){ go(nx.dataset.next,nx); return; }
-  if(t.closest("[data-home]")||t.closest("#back")||t.closest("#brand")){ goHome(); return; }
+  log("click",{target:desc(t),detail:e.detail,at:Math.round(e.clientX)+","+Math.round(e.clientY)});
+  if(t.closest("#dbg")) return;
+  const nav=t.closest(NAVSEL);
+  if(nav){
+    if(e.detail!==0&&e.timeStamp<swallowUntil){ swallowUntil=0; e.preventDefault(); log("click-swallowed",{target:desc(nav),why:"click derived from a touch already handled on pointerup"}); return; }
+    if(e.detail===0){ activate(nav,"key/assistive"); return; }      // keyboard, screen readers, element.click()
+    const [ok,why]=press?pressOK(nav):[true,"no pointer press (assistive)"]; press=null;
+    if(!ok){ e.preventDefault(); log("click-rejected",{target:desc(nav),why}); return; }
+    activate(nav,"click"); return;
+  }
+  press=null;
   const st=t.closest("[data-step]"); if(st&&!st.disabled){ setStep(+st.dataset.step,st); return; }
   const ph=t.closest("[data-photo]"); if(ph){ setPhoto(ph.dataset.photo,ph); return; }
   const ps=t.closest("[data-photo-step]"); if(ps){ const i=(PH.indexOf(photo)+ +ps.dataset.photoStep+3)%3; setPhoto(PH[i],ps); return; }
   if(t.closest("#unzoom")){ resetZoom(true); $("#plate")?.focus({preventScroll:true}); return; }
   const qb=t.closest("[data-q]"); if(qb){ setQ(+qb.dataset.q); return; }
 });
-document.addEventListener("pointerup",()=>{ if(!T) setTimeout(()=>{ if(!T) $$("#home .pressed").forEach(s=>s.classList.remove("pressed")); },250); });
 
 /* how: one step at a time */
 function setStep(n,from){
@@ -1117,8 +1283,8 @@ document.addEventListener("submit",e=>{
   if(n){ n.textContent=U().contact.sent; }   // no service connected: never report a successful send
 });
 document.addEventListener("keydown",e=>{
-  if(e.key==="Escape"){ if(Z.s>1&&targetView()==="product"){ resetZoom(true); $("#plate")?.focus({preventScroll:true}); return; } goHome(); return; }
-  if(targetView()==="how"&&!T&&(e.key==="ArrowLeft"||e.key==="ArrowRight")&&!e.target.closest("input,textarea,select,#plate")){
+  if(e.key==="Escape"){ if(Z.s>1&&targetView()==="product"){ resetZoom(true); $("#plate")?.focus({preventScroll:true}); return; } goHome("Escape key"); return; }
+  if(NAV.phase==="world"&&NAV.id==="how"&&(e.key==="ArrowLeft"||e.key==="ArrowRight")&&!e.target.closest("input,textarea,select,#plate")){
     const fwd=(e.key==="ArrowLeft")===(lang==="ar"); setStep(step+(fwd?1:-1),null); e.preventDefault();
   }
 });
@@ -1135,7 +1301,7 @@ addEventListener("resize",()=>{ if(Z.s>1) applyZ(false); });
 
 /* language: keeps step, angle, open question, scroll and any form values */
 $("#lang").addEventListener("click",()=>{
-  if(T) finishNow();
+  finishActive();
   const cur=view, sc=cur!=="home"?$("#w-"+cur).scrollTop:$("#home").scrollTop;
   formKeep=readForm()||formKeep;
   lang=lang==="ar"?"en":"ar";
@@ -1147,6 +1313,18 @@ $("#lang").addEventListener("click",()=>{
   $("#lang").focus({preventScroll:true});
 });
 
+/* ---------- diagnostics panel ---------- */
+$("#build").textContent=BUILD;
+$("#dbg-close").addEventListener("click",()=>setDbg(false));
+$("#dbg-toggle").addEventListener("click",()=>{ const b=$("#dbg"), o=!b.classList.contains("open"); b.classList.toggle("open",o); $("#dbg-toggle").setAttribute("aria-expanded",o); paintDbg(); });
+$("#dbg-clear").addEventListener("click",()=>{ DBG.buf=[]; log("cleared"); });
+$("#dbg-copy").addEventListener("click",()=>{
+  const txt=logText(), msg=$("#dbg-msg"), ta=$("#dbg-txt");
+  const fallback=()=>{ ta.hidden=false; ta.value=txt; ta.focus(); ta.select(); msg.hidden=false; msg.textContent="تعذّر النسخ التلقائي — النص محدد في المربع، انسخيه يدويًا."; };
+  try{ navigator.clipboard.writeText(txt).then(()=>{ msg.hidden=false; msg.textContent=`نُسخ السجل (${DBG.buf.length} حدثًا).`; },fallback); }catch(_){ fallback(); }
+});
+console.info("Warmhug build",BUILD);
+
 /* ---------- boot ---------- */
 document.documentElement.lang="ar"; document.documentElement.dir="rtl";
 renderAll();
@@ -1155,7 +1333,11 @@ $$("#spots .spot").forEach(s=>s.classList.add("enter-in"));
 setTimeout(()=>$$(".spot.enter-in").forEach(s=>s.classList.remove("enter-in")),1900);
 $$(".world").forEach(w=>w.inert=true);
 const start=(location.hash||"").slice(1);
-if(W[start]){ try{ history.replaceState({w:start},"","#"+start); }catch(e){} enter(start,null,{push:false,instant:true}); }
+/* opened on a section link: give it a home entry underneath, so "back" returns to the scene instead of leaving the site */
+log("boot",{build:BUILD,link:start||"-"});
+if(DBG.on) setDbg(true);
+if(W[start]){ stamp(histHome(),BASE,false); stamp({wh:1,id:start,fromHome:true},"#"+start,true); enter(start,null,"boot",true); }
+else stamp(histHome(),BASE,false);
 })();
 </script>
 
